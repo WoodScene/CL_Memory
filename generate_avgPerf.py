@@ -1,18 +1,18 @@
-# 生成计算averageJGA指标所需要的预测结果
+# 生成计算 average JGA 指标所需要的预测结果
 
 import os
 import sys
 import json
 import fire
-import gradio as gr
 import torch
 import transformers
 from peft import PeftModel
-from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.dataset_order import get_dataset_order
 from utils.callbacks import Iteratorize, Stream
 from utils.prompter import Prompter
 
+# ========= 设备选择 =========
 if torch.cuda.is_available():
     device = "cuda"
 else:
@@ -25,108 +25,171 @@ except:  # noqa: E722
     pass
 
 
-
-
 def main(
-    load_8bit: bool = True,
-    base_model: str = "decapoda-research/llama-7b-hf",
+    base_model: str = "",
     lora_weights: str = "",
     prompt_template: str = "",  # The prompt template to use, will default to alpaca.
-    server_name: str = "0.0.0.0",  # Allows to listen on all interfaces by providing '0.
-    share_gradio: bool = False,
     testfile_name: str = "",
-    testfile_idx: str = "",
     output_file: str = "",
-    lora_type: str = "TaSL",
-    dataset_id: int = 1, # 1 - 5  5次实验
+    dataset_id: int = 1,  # 1 - 5  5次实验
     method_name: str = "",
     model_type: str = "",
-    hyper_para: int = 0, # 超参数的组合
+    hyper_para: int = 0,  # 超参数的组合
+    use_latest_checkpoint: bool = False,  # 如果 True，使用最新的 checkpoint 而不是最后一个任务
+    max_task_id: int = None,             # 如果指定，使用该 task_id 的 checkpoint
+    output_root: str = "./output",       # ⭐ 自定义输出根目录
+    lora_checkpoint_path: str = "/workspace/CL_checkpoints_exp_1",  # ⭐ checkpoint 根目录路径
 ):
+    print(f"base_model: {base_model}")
     print(f"dataset_id: {dataset_id}")
     print(f"method_name: {method_name}")
-    print(f"lora_type: {lora_type}")
     print(f"hyper_para: {hyper_para}")
-    # 已知了dataset id，我们就知道最后一个service是什么，然后用他的weight来进行测试
+    print(f"output_root: {output_root}")
+    print(f"lora_checkpoint_path: {lora_checkpoint_path}")
+
+    # ===== 1. 确定使用哪个 checkpoint =====
     dataset_order = get_dataset_order(dataset_id)
-    last_service_name = dataset_order[-1]
     model_name = base_model.split("/")[-1] + "lora" + str(model_type)
 
-    lora_weights = os.path.join("./checkpoint_files", model_name + "_"+ method_name +"_dataset_id_"+str(dataset_id), str(len(dataset_order)-1)+"-"+last_service_name)
+    if max_task_id is not None:
+        # 使用指定的 task_id
+        task_id_to_use = max_task_id
+        service_name_to_use = dataset_order[task_id_to_use]
+    elif use_latest_checkpoint:
+        # 自动查找最新的 checkpoint（task_id 最大的那个）
+        checkpoint_base = os.path.join(
+            "./checkpoint_files",
+            model_name + "_" + method_name + "_dataset_id_" + str(dataset_id),
+        )
+        if os.path.exists(checkpoint_base):
+            max_task_id_found = -1
+            for item in os.listdir(checkpoint_base):
+                item_path = os.path.join(checkpoint_base, item)
+                # 目录名形如 "2-task1290"
+                if os.path.isdir(item_path) and item[0].isdigit():
+                    try:
+                        task_id_tmp = int(item.split("-")[0])
+                        if task_id_tmp > max_task_id_found:
+                            max_task_id_found = task_id_tmp
+                    except Exception:
+                        pass
+            if max_task_id_found >= 0:
+                task_id_to_use = max_task_id_found
+                service_name_to_use = dataset_order[task_id_to_use]
+                print(
+                    f"自动找到最新的 checkpoint: task_id={task_id_to_use}, "
+                    f"service={service_name_to_use}"
+                )
+            else:
+                task_id_to_use = len(dataset_order) - 1
+                service_name_to_use = dataset_order[-1]
+        else:
+            task_id_to_use = len(dataset_order) - 1
+            service_name_to_use = dataset_order[-1]
+    else:
+        # 默认使用最后一个任务的 checkpoint
+        task_id_to_use = len(dataset_order) - 1
+        service_name_to_use = dataset_order[-1]
 
+    # ===== 2. 组装 LoRA checkpoint 路径 =====
+    lora_weights = os.path.join(
+        lora_checkpoint_path,
+        model_name + "_" + method_name + "_dataset_id_" + str(dataset_id),
+        f"{task_id_to_use}-{service_name_to_use}",
+    )
 
     if not os.path.exists(lora_weights):
         print(f"lora dir {lora_weights} not find!")
-        sys.exit(1)   
-    assert (
-        lora_weights
-    ), "Please specify a --lora_weights, e.g. --lora_weights='xxx'"
+        sys.exit(1)
 
-    output_dir = os.path.join("./output", model_name + "_"+ method_name +"_dataset_id_"+str(dataset_id)+"_avgPerf")
-
+    # ========= avgPerf 专用输出结构 =========
+    output_dir = os.path.join(
+        output_root,
+        model_name + "_" + method_name + "_dataset_id_" + str(dataset_id) + "_avgPerf",
+    )
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
+        
     print(f"lora_weights: {lora_weights}")
     print(f"output_dir: {output_dir}")
-    
-    
-    
+        
+    # ===== 3. 构建 tokenizer / model =====
     prompter = Prompter(prompt_template)
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
-    #print(torch.cuda.is_available())
-    #sys.exit(1)
+    # ---- 打印并确认 tokenizer 的特殊 token 配置 ----
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id
+    print(f"[Tokenizer] bos={bos}, eos={eos}, pad={pad}")
+
+    # ---- 兜底处理：如果没有 pad_token，才 fallback 到 eos ----
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # ---- Qwen/LLaMA 系列强烈推荐 left padding（训练和推理一致）----
+    tokenizer.padding_side = "left"
+
+    # ==================================================
+    #  加载模型（注意：不要覆盖 Qwen 的 bos/eos 配置）
+    #  只同步 pad 即可！
+    # ==================================================
+    
     if device == "cuda":
-        model = LlamaForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            load_in_8bit=load_8bit,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
+            trust_remote_code=True,
         )
+        # 让 PEFT 自动读取 adapter_config.json 里的 target_modules
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
     elif device == "mps":
-        model = LlamaForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             base_model,
             device_map={"": device},
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
+            trust_remote_code=True,
         )
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
             device_map={"": device},
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
     else:
-        model = LlamaForCausalLM.from_pretrained(
-            base_model, device_map={"": device}, low_cpu_mem_usage=True
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            device_map={"": device},
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
         )
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
             device_map={"": device},
         )
-    #print(model.config.use_cache)
-    #sys.exit(1)
-    # unwind broken decapoda-research config
-    model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
-    model.config.bos_token_id = 1
-    model.config.eos_token_id = 2
 
-    if not load_8bit:
-        model.half()  # seems to fix bugs for some users.
+    # ---- 只同步 pad_token_id，保持 Qwen 原生 bos/eos ----
+    model.config.pad_token_id = tokenizer.pad_token_id
 
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
-        model = torch.compile(model)
+        try:
+            model = torch.compile(model)
+        except Exception:
+            # 有些 peft + compile 组合不稳定，失败就忽略
+            pass
 
+    # ===== 4. 定义推理函数 =====
     def evaluate(
         instruction,
         input=None,
-        temperature=0.02,
+        temperature=0.02,  
         top_p=0,
         top_k=1,
         num_beams=1,
@@ -137,87 +200,100 @@ def main(
         prompt = prompter.generate_prompt(instruction, input)
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(device)
-        generation_config = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_beams=num_beams,
-            **kwargs,
-        )
+        attention_mask = inputs.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
-        generate_params = {
-            "input_ids": input_ids,
-            "generation_config": generation_config,
-            "return_dict_in_generate": True,
-            "output_scores": True,
-            "max_new_tokens": max_new_tokens,
-        }
-        
-        # Without streaming
+        # ✅ 不再使用 GenerationConfig，直接在 generate 里写参数
+        # ✅ 这里选择确定性解码，适合做 FWT/BWT 评估
         with torch.no_grad():
             generation_output = model.generate(
                 input_ids=input_ids,
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-                output_scores=True,
+                attention_mask=attention_mask,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                num_beams=num_beams,
                 max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
             )
-        #print(generation_output)
+
         s = generation_output.sequences[0]
-        output = tokenizer.decode(s)
+        output = tokenizer.decode(
+            s,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )
         return prompter.get_response(output)
-        #return tokenizer.batch_decode(generation_output, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        #return output.split("### Response:")[1].strip()
 
+    # ===== 5. 遍历每个 service，生成预测结果 =====
+    # 使用到 task_id_to_use 为止（例如只训练到第 2 个任务，就只评 0,1,2）
+    max_service_id = (
+        task_id_to_use + 1
+        if (use_latest_checkpoint or max_task_id is not None)
+        else len(dataset_order)
+    )
 
-    # 从这开始遍历15个service，每一个service的结果存在一个文件夹中
-    for service_id in range(0, len(dataset_order)):
-        print(f"current service name: {dataset_order[service_id]}... begin generating!")
-        
-        output_file = os.path.join(output_dir, str(service_id)+"-"+dataset_order[service_id] +"_result.txt")
+    for service_id in range(0, max_service_id):
+        print(
+            f"current service name: {dataset_order[service_id]}... begin generating!"
+        )
+
+        output_file = os.path.join(
+            output_dir, f"{service_id}-{dataset_order[service_id]}_result.txt"
+        )
         print(f"output filename: {output_file}")
-        
-        testfile_name = "./data_longsequence_llama/test/" + dataset_order[service_id] + ".json"
-        
-        print(f"test filename: {testfile_name}")
-        
 
-        if not os.path.isfile(output_file): # 如果文件不存在，就新建文件，从头开始写入
-            result_out = open(output_file, "w", encoding='utf-8')
-            begin_id = 0 # 相当于从头开始获取结果
-            print("——————————————————————————————从头开始写入——————————————————————————————")
-        else: # 如果文件已经存在了，我们看看已经写了多少行了，需要继续从哪里开始获取结果
-            with open(output_file, "r") as f:
+        # 这里统一用 ./data/test/{task_name}.json
+        testfile_name = "./data/test/" + dataset_order[service_id] + ".json"
+        print(f"test filename: {testfile_name}")
+
+        if not os.path.isfile(testfile_name):
+            print(f"test file {testfile_name} not found!")
+            sys.exit(1)
+
+        # 判断是否断点续生成
+        if not os.path.isfile(output_file):
+            # 文件不存在，从头开始写
+            result_out = open(output_file, "w", encoding="utf-8")
+            begin_id = 0
+            print("———— 从头开始写入 ————")
+        else:
+            # 文件存在，接着之前的行数继续生成
+            with open(output_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
                 begin_id = len(lines)
-                f.close()
-            print(f"——————————————————————————————从第{begin_id}行开始写入——————————————————————————————")
-            result_out = open(output_file, "a", encoding='utf-8')
-        
+            print(f"———— 从第 {begin_id} 行开始写入 ————")
+            result_out = open(output_file, "a", encoding="utf-8")
 
-        data = json.load(open(testfile_name)) 
+        data = json.load(open(testfile_name, "r", encoding="utf-8"))
+
         for idx_ in range(begin_id, len(data)):
             sample = data[idx_]
 
             Response_list = []
-
-            Response = evaluate(instruction = sample['instruction'], input = sample['input'])
+            Response = evaluate(
+                instruction=sample["instruction"], input=sample["input"]
+            )
             Response_list.append(Response)
 
-            #print("Input:", input2)
+            print("idx:", idx_)
             print("Response list:", Response_list)
-            print("Ground truth:", sample['output'])
+            print("Ground truth:", sample["output"])
             print()
-            # if "NONE" not in Response:
-            #     break
-            # if sample['output'] != "NONE":
-            #     break
-            result_out.write(sample['id'] + "|||" + sample['output']+ "|||" + str(Response_list))
+
+            # ⭐ 核心：把 gold 变成单行并合并多空白
+            gold = " ".join(sample["output"].split())
+
+            result_out.write(
+                sample["id"] + "|||" + gold + "|||" + str(Response_list)
+            )
             result_out.write("\n")
 
-            #break
         result_out.close()
         print(f"current service name: {dataset_order[service_id]}... Generate End!")
+
 
 if __name__ == "__main__":
     fire.Fire(main)

@@ -1,19 +1,24 @@
-# 生成计算bwt指标所需要的预测结果
-# 这里只需要计算第i次训练完，在service i上的效果就行。另一部分的结果已经计算了
+# 生成计算 BWT 指标所需要的预测结果
+# 这里只需要计算第 i 次训练完，在 service i 上的效果就行。另一部分的结果已经计算了。
 
 import os
 import sys
 import json
 import fire
-import gradio as gr
 import torch
 import transformers
 from peft import PeftModel
-from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer
+from transformers import (
+    GenerationConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+)
 
 from utils.callbacks import Iteratorize, Stream
 from utils.prompter import Prompter
+from utils.dataset_order import get_dataset_order
 
+# 设备选择
 if torch.cuda.is_available():
     device = "cuda"
 else:
@@ -22,107 +27,119 @@ else:
 try:
     if torch.backends.mps.is_available():
         device = "mps"
-except:  # noqa: E722
+except:
     pass
-
-from utils.dataset_order import get_dataset_order
-
 
 
 def main(
-    load_8bit: bool = True,
-    base_model: str = "decapoda-research/llama-7b-hf",
+    base_model: str = "",
     lora_weights: str = "",
-    prompt_template: str = "",  # The prompt template to use, will default to alpaca.
-    server_name: str = "0.0.0.0",  # Allows to listen on all interfaces by providing '0.
+    prompt_template: str = "", 
+    server_name: str = "0.0.0.0",
     share_gradio: bool = False,
     testfile_name: str = "",
     testfile_idx: str = "",
     output_file: str = "",
-    lora_type: str = "TaSL",
-    dataset_id: int = 1, # 1 - 5  5次实验
-    service_begin_id: int = 0 ,
+    dataset_id: int = 1,
+    service_begin_id: int = 0,
     method_name: str = "",
     model_type: str = "",
-    
+    output_root: str = "./output",     # ⭐⭐⭐ 新增自定义输出路径
+    lora_checkpoint_path: str = "/workspace/CL_checkpoints_exp_1",  # ⭐ 新增：checkpoint 根目录路径
 ):
     print(f"base_model: {base_model}")
-    
     print(f"dataset_id: {dataset_id}")
     print(f"service_begin_id: {service_begin_id}")
-    print(f"lora_type: {lora_type}")
     print(f"method_name: {method_name}")
+    print(f"output_root: {output_root}")
+    print(f"lora_checkpoint_path: {lora_checkpoint_path}")
+
     dataset_order = get_dataset_order(dataset_id)
     service_name = dataset_order[service_begin_id]
     model_name = base_model.split("/")[-1] + "lora" + str(model_type)
     print(f"model_name: {model_name}")
 
-    lora_weights = os.path.join("./checkpoint_files", model_name + "_"+ method_name +"_dataset_id_"+str(dataset_id), str(service_begin_id)+"-"+service_name)
-    
+    # 对应第 i 次训练完成后的 LoRA 权重： i-taskName
+    # lora路径修改
+    lora_weights = os.path.join(
+        lora_checkpoint_path,
+        model_name + "_" + method_name + "_dataset_id_" + str(dataset_id),
+        f"{service_begin_id}-{service_name}",
+    )
+
     if not os.path.exists(lora_weights):
         print(f"lora dir {lora_weights} not find!")
-        sys.exit(1)   
-    assert (
-        lora_weights
-    ), "Please specify a --lora_weights, e.g. --lora_weights='xxx'"
+        sys.exit(1)
 
+    # ========= BWT 专用输出结构 =========
+    output_dir = os.path.join(
+        output_root,
+        model_name + "_" + method_name + "_dataset_id_" + str(dataset_id) + "_bwt",
+    )
+    os.makedirs(output_dir, exist_ok=True)
 
-    output_dir = os.path.join("./output", model_name + "_"+ method_name +"_dataset_id_"+str(dataset_id)+"_bwt")
-
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
     print(f"lora_weights: {lora_weights}")
     print(f"output_dir: {output_dir}")
-    
-    
-    
-    prompter = Prompter(prompt_template)
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
 
-    #print(torch.cuda.is_available())
-    #sys.exit(1)
+    # ===== 3. 构建 tokenizer / model =====
+    prompter = Prompter(prompt_template)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+
+    # ---- 打印并确认 tokenizer 的特殊 token 配置 ----
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id
+    print(f"[Tokenizer] bos={bos}, eos={eos}, pad={pad}")
+
+    # ---- 兜底处理：如果没有 pad_token，才 fallback 到 eos ----
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # ---- Qwen/LLaMA 系列强烈推荐 left padding（训练和推理一致）----
+    tokenizer.padding_side = "left"
+
+    # ==================================================
+    #  加载模型（注意：不要覆盖 Qwen 的 bos/eos 配置）
+    #  只同步 pad 即可！
+    # ==================================================
+
     if device == "cuda":
-        model = LlamaForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            load_in_8bit=load_8bit,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
         )
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
     elif device == "mps":
-        model = LlamaForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             base_model,
             device_map={"": device},
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
             device_map={"": device},
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
     else:
-        model = LlamaForCausalLM.from_pretrained(
-            base_model, device_map={"": device}, low_cpu_mem_usage=True
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            device_map={"": device},
+            low_cpu_mem_usage=True,
         )
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
             device_map={"": device},
         )
-    #print(model.config.use_cache)
-    #sys.exit(1)
-    # unwind broken decapoda-research config
-    model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
-    model.config.bos_token_id = 1
-    model.config.eos_token_id = 2
-
-    if not load_8bit:
-        model.half()  # seems to fix bugs for some users.
+    
+    # ---- 只同步 pad_token_id，保持 Qwen 原生 bos/eos ----
+    model.config.pad_token_id = tokenizer.pad_token_id
 
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
@@ -131,7 +148,7 @@ def main(
     def evaluate(
         instruction,
         input=None,
-        temperature=0.02,
+        temperature=0.02,  
         top_p=0,
         top_k=1,
         num_beams=1,
@@ -142,87 +159,91 @@ def main(
         prompt = prompter.generate_prompt(instruction, input)
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(device)
-        generation_config = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_beams=num_beams,
-            **kwargs,
-        )
+        attention_mask = inputs.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
-        generate_params = {
-            "input_ids": input_ids,
-            "generation_config": generation_config,
-            "return_dict_in_generate": True,
-            "output_scores": True,
-            "max_new_tokens": max_new_tokens,
-        }
-        
-        # Without streaming
+        # ✅ 不再使用 GenerationConfig，直接在 generate 里写参数
+        # ✅ 这里选择确定性解码，适合做 FWT/BWT 评估
         with torch.no_grad():
             generation_output = model.generate(
                 input_ids=input_ids,
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-                output_scores=True,
+                attention_mask=attention_mask,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                num_beams=num_beams,
                 max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
             )
-        #print(generation_output)
+
         s = generation_output.sequences[0]
-        output = tokenizer.decode(s)
+        output = tokenizer.decode(
+            s,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )
         return prompter.get_response(output)
-        #return tokenizer.batch_decode(generation_output, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        #return output.split("### Response:")[1].strip()
 
 
-
+    # ===== 只在当前 service 上做推理 =====
     service_id = service_begin_id
     print(f"current service name: {dataset_order[service_id]}... begin generating!")
-    
-    output_file = os.path.join(output_dir, str(service_id)+"-"+dataset_order[service_id] +"_result.txt")
+
+    output_file = os.path.join(
+        output_dir,
+        f"{service_id}-{dataset_order[service_id]}_result.txt",
+    )
     print(f"output filename: {output_file}")
-    
-    testfile_name = "./data_longsequence_llama/test/" + dataset_order[service_id] + ".json"
-    
+
+    # 测试集路径
+    testfile_name = "./data/test/" + dataset_order[service_id] + ".json"
     print(f"test filename: {testfile_name}")
-    
 
-    if not os.path.isfile(output_file): # 如果文件不存在，就新建文件，从头开始写入
-        result_out = open(output_file, "w", encoding='utf-8')
-        begin_id = 0 # 相当于从头开始获取结果
-        print("——————————————————————————————从头开始写入——————————————————————————————")
-    else: # 如果文件已经存在了，我们看看已经写了多少行了，需要继续从哪里开始获取结果
-        with open(output_file, "r") as f:
-            lines = f.readlines()
-            begin_id = len(lines)
-            f.close()
-        print(f"——————————————————————————————从第{begin_id}行开始写入——————————————————————————————")
-        result_out = open(output_file, "a", encoding='utf-8')
-    
+    if not os.path.isfile(testfile_name):
+        print(f"test file {testfile_name} not found!")
+        sys.exit(1)
 
-    data = json.load(open(testfile_name)) 
+    # ===== 断点续跑 =====
+    if not os.path.isfile(output_file):
+        result_out = open(output_file, "w", encoding="utf-8")
+        begin_id = 0
+        print("———————— 从头开始写入 ————————")
+    else:
+        with open(output_file, "r", encoding="utf-8") as f:
+            begin_id = len(f.readlines())
+        print(f"———————— 从第 {begin_id} 行开始写入 ————————")
+        result_out = open(output_file, "a", encoding="utf-8")
+
+    data = json.load(open(testfile_name, "r", encoding="utf-8"))
+    
     for idx_ in range(begin_id, len(data)):
         sample = data[idx_]
 
         Response_list = []
-
-        Response = evaluate(instruction = sample['instruction'], input = sample['input'])
+        Response = evaluate(
+            instruction=sample["instruction"], input=sample["input"]
+        )
         Response_list.append(Response)
 
-        #print("Input:", input2)
+        print("idx:", idx_)
         print("Response list:", Response_list)
-        print("Ground truth:", sample['output'])
+        print("Ground truth:", sample["output"])
         print()
-        # if "NONE" not in Response:
-        #     break
-        # if sample['output'] != "NONE":
-        #     break
-        result_out.write(sample['id'] + "|||" + sample['output']+ "|||" + str(Response_list))
+
+        # ⭐ 核心：把 gold 变成单行并合并多空白
+        gold = " ".join(sample["output"].split())
+
+        result_out.write(
+            sample["id"] + "|||" + gold + "|||" + str(Response_list)
+        )
         result_out.write("\n")
 
-        #break
+
     result_out.close()
     print(f"current service name: {service_name}... Generate End!")
+
 
 if __name__ == "__main__":
     fire.Fire(main)
